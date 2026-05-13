@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Three.js bench</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #121826; overflow: hidden; color: #fff; }
+      canvas { display: block; }
+      #hud {
+        position: absolute; top: 8px; left: 8px;
+        font: 12px/1.4 ui-monospace, Menlo, monospace;
+        background: rgba(0,0,0,0.5); padding: 6px 10px; border-radius: 4px;
+        pointer-events: none; white-space: pre;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "three/addons/": "./vendor/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="hud">starting…</div>
+    <script type="module">
+      import * as THREE from 'three';
+
+      // ---- noise for terrain ----
+      const hash = (x, y) => {
+        const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+        return s - Math.floor(s);
+      };
+      const smooth = t => t * t * (3 - 2 * t);
+      const noise = (x, y) => {
+        const xi = Math.floor(x), yi = Math.floor(y);
+        const xf = x - xi, yf = y - yi;
+        const u = smooth(xf), v = smooth(yf);
+        return (1-u)*(1-v)*hash(xi,yi) + u*(1-v)*hash(xi+1,yi)
+             + (1-u)*v*hash(xi,yi+1)   + u*v*hash(xi+1,yi+1);
+      };
+      const fbm = (x, y, oct = 5) => {
+        let a = 1, f = 1, s = 0, n = 0;
+        for (let i = 0; i < oct; i++) { s += a * noise(x*f, y*f); n += a; a *= 0.5; f *= 2; }
+        return s / n;
+      };
+
+      // ---- shared renderer & camera ----
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      document.body.appendChild(renderer.domElement);
+
+      const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.1, 1000);
+
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      // ---- scene builders ----
+      function buildEmpty() {
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121826);
+        return { scene, cam: [0, 0, 5], target: [0, 0, 0], tris: 0, shadow: false, dispose() {} };
+      }
+
+      function buildCube() {
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121826);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+        const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+        dir.position.set(5, 5, 5); scene.add(dir);
+        const g = new THREE.BoxGeometry(1, 1, 1);
+        const m = new THREE.MeshStandardMaterial({ color: 0x44aa88 });
+        scene.add(new THREE.Mesh(g, m));
+        return { scene, cam: [3, 2, 4], target: [0, 0, 0], tris: 12, shadow: false,
+                 dispose() { g.dispose(); m.dispose(); } };
+      }
+
+      function buildTerrain(seg, withShadow) {
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87a8c0);
+        scene.fog = new THREE.Fog(0x87a8c0, 90, 320);
+
+        const SIZE = 200, MAX_H = 28;
+        const geo = new THREE.PlaneGeometry(SIZE, SIZE, seg, seg);
+        geo.rotateX(-Math.PI / 2);
+        const pos = geo.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+          const x = pos.getX(i), z = pos.getZ(i);
+          const base  = fbm(x * 0.012 + 100, z * 0.012 + 100, 5);
+          const ridge = 1 - Math.abs(fbm(x * 0.025, z * 0.025, 4) - 0.5) * 2;
+          pos.setY(i, (base * 0.7 + ridge * ridge * 0.45 - 0.35) * MAX_H);
+        }
+        geo.computeVertexNormals();
+
+        const mat = new THREE.MeshStandardMaterial({ color: 0x6a8a55, roughness: 0.95 });
+        const terrain = new THREE.Mesh(geo, mat);
+        terrain.receiveShadow = withShadow;
+        terrain.castShadow = withShadow;
+        scene.add(terrain);
+
+        scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x404020, 0.55));
+        const sun = new THREE.DirectionalLight(0xfff1c4, 1.3);
+        sun.position.set(70, 100, 35);
+        if (withShadow) {
+          sun.castShadow = true;
+          sun.shadow.mapSize.set(2048, 2048);
+          const s = sun.shadow.camera;
+          s.left = -130; s.right = 130; s.top = 130; s.bottom = -130;
+          s.near = 10; s.far = 280;
+        }
+        scene.add(sun);
+
+        const tris = geo.index.count / 3;
+        return { scene, cam: [95, 65, 95], target: [0, 4, 0], tris, shadow: withShadow,
+                 dispose() { geo.dispose(); mat.dispose(); } };
+      }
+
+      function buildInstanced(n) {
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121826);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+        const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+        dir.position.set(5, 8, 5); scene.add(dir);
+
+        const g = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+        const m = new THREE.MeshStandardMaterial({ color: 0x44aa88 });
+        const mesh = new THREE.InstancedMesh(g, m, n);
+        const mat4 = new THREE.Matrix4();
+        const r = Math.cbrt(n) * 1.5;
+        for (let i = 0; i < n; i++) {
+          mat4.setPosition((Math.random()-0.5)*r*2, (Math.random()-0.5)*r*2, (Math.random()-0.5)*r*2);
+          mesh.setMatrixAt(i, mat4);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+        scene.add(mesh);
+
+        return { scene, cam: [r*1.4, r*0.7, r*1.4], target: [0, 0, 0], tris: n * 12, shadow: false,
+                 dispose() { g.dispose(); m.dispose(); } };
+      }
+
+      // ---- harness ----
+      const tests = [
+        ['baseline (empty)',              buildEmpty],
+        ['single cube',                   buildCube],
+        ['terrain 128² no shadow',        () => buildTerrain(128, false)],
+        ['terrain 256² no shadow',        () => buildTerrain(256, false)],
+        ['terrain 320² no shadow',        () => buildTerrain(320, false)],
+        ['terrain 320² shadow 2048²',     () => buildTerrain(320, true)],
+        ['terrain 512² no shadow',        () => buildTerrain(512, false)],
+        ['instanced cubes ×10k',          () => buildInstanced(10000)],
+        ['instanced cubes ×100k',         () => buildInstanced(100000)],
+        ['instanced cubes ×500k',         () => buildInstanced(500000)],
+      ];
+
+      const hud = document.getElementById('hud');
+      const results = [];
+      window.__benchProgress = { done: 0, total: tests.length, current: '' };
+
+      // Uncapped tight-loop measurement: bypasses rAF/vsync so we measure
+      // how fast the engine can actually submit + execute frames.
+      function runWindow(scene, target, seconds, measure) {
+        let frames = 0;
+        let renderMs = 0;
+        const t0 = performance.now();
+        while (performance.now() - t0 < seconds * 1000) {
+          const r = Math.hypot(camera.position.x, camera.position.z);
+          const ang = Math.atan2(camera.position.z, camera.position.x) + 0.002;
+          camera.position.x = Math.cos(ang) * r;
+          camera.position.z = Math.sin(ang) * r;
+          camera.lookAt(target[0], target[1], target[2]);
+
+          const r0 = performance.now();
+          renderer.render(scene, camera);
+          // Force the driver to actually flush the GPU queue so we measure
+          // real per-frame cost, not just command-submission cost.
+          renderer.getContext().finish();
+          if (measure) { renderMs += performance.now() - r0; frames++; }
+        }
+        const elapsed = (performance.now() - t0) / 1000;
+        return {
+          fps: frames / elapsed,
+          frames,
+          seconds: elapsed,
+          renderMsPerFrame: frames ? renderMs / frames : 0,
+        };
+      }
+
+      async function run() {
+        for (let i = 0; i < tests.length; i++) {
+          const [name, build] = tests[i];
+          window.__benchProgress.current = name;
+
+          const built = build();
+          camera.position.set(...built.cam);
+          camera.lookAt(...built.target);
+          renderer.shadowMap.enabled = built.shadow;
+
+          runWindow(built.scene, built.target, 0.5, false);  // warmup
+          const m = runWindow(built.scene, built.target, 2.0, true);
+          // yield so the HUD can repaint between tests
+          await new Promise(r => setTimeout(r, 50));
+          results.push({
+            name,
+            tris: built.tris,
+            shadow: built.shadow,
+            fps: +m.fps.toFixed(2),
+            frames: m.frames,
+            renderMsPerFrame: +m.renderMsPerFrame.toFixed(3),
+          });
+
+          built.dispose();
+          window.__benchProgress.done = i + 1;
+          hud.textContent =
+            `running ${i+1}/${tests.length}: ${name}\n` +
+            results.map(r => `  ${r.fps.toFixed(1).padStart(6)} fps · ${String(r.tris).padStart(8)} tris · ${r.name}`).join('\n');
+        }
+        window.__benchResults = results;
+        hud.textContent = 'done.\n' +
+          results.map(r => `  ${r.fps.toFixed(1).padStart(6)} fps · ${String(r.tris).padStart(8)} tris · ${r.name}`).join('\n');
+      }
+
+      run();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Three.js Terrain in PySide6</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #87a8c0; overflow: hidden; }
+      canvas { display: block; }
+      #hud {
+        position: absolute; top: 8px; left: 8px;
+        font: 12px/1.4 ui-monospace, Menlo, monospace;
+        color: #fff; background: rgba(0,0,0,0.45);
+        padding: 6px 10px; border-radius: 4px; pointer-events: none;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "three/addons/": "./vendor/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="hud">loading…</div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+      // ---- value-noise FBM (deterministic, no deps) ----
+      const hash = (x, y) => {
+        const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+        return s - Math.floor(s);
+      };
+      const smooth = t => t * t * (3 - 2 * t);
+      const noise = (x, y) => {
+        const xi = Math.floor(x), yi = Math.floor(y);
+        const xf = x - xi, yf = y - yi;
+        const u = smooth(xf), v = smooth(yf);
+        const v00 = hash(xi, yi),     v10 = hash(xi + 1, yi);
+        const v01 = hash(xi, yi + 1), v11 = hash(xi + 1, yi + 1);
+        return (1 - u) * (1 - v) * v00 + u * (1 - v) * v10
+             + (1 - u) * v       * v01 + u * v       * v11;
+      };
+      const fbm = (x, y, octaves = 6) => {
+        let amp = 1, freq = 1, sum = 0, norm = 0;
+        for (let i = 0; i < octaves; i++) {
+          sum  += amp * noise(x * freq, y * freq);
+          norm += amp;
+          amp  *= 0.5;
+          freq *= 2;
+        }
+        return sum / norm;
+      };
+
+      // ---- scene & renderer ----
+      const SKY = 0x87a8c0;
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(SKY);
+      scene.fog = new THREE.Fog(SKY, 90, 320);
+
+      const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 1000);
+      camera.position.set(95, 65, 95);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      document.body.appendChild(renderer.domElement);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 4, 0);
+      controls.enableDamping = true;
+      controls.maxPolarAngle = Math.PI * 0.495;
+      controls.minDistance = 25;
+      controls.maxDistance = 280;
+
+      // ---- terrain ----
+      const SIZE = 200, SEG = 320, MAX_H = 28;
+      const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
+      geo.rotateX(-Math.PI / 2);
+      const pos = geo.attributes.position;
+      const colors = new Float32Array(pos.count * 3);
+
+      const C = {
+        water:  new THREE.Color(0x2a5a86),
+        sand:   new THREE.Color(0xc9b787),
+        grass:  new THREE.Color(0x5e8b3a),
+        forest: new THREE.Color(0x3d6326),
+        rock:   new THREE.Color(0x796856),
+        snow:   new THREE.Color(0xeef2f5),
+      };
+      const mix = (a, b, t) => a.clone().lerp(b, Math.max(0, Math.min(1, t)));
+
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i), z = pos.getZ(i);
+        const base  = fbm(x * 0.012 + 100, z * 0.012 + 100, 6);
+        const ridge = 1 - Math.abs(fbm(x * 0.025, z * 0.025, 4) - 0.5) * 2;
+        const elev  = base * 0.7 + ridge * ridge * 0.45 - 0.35;
+        const h     = elev * MAX_H;
+        pos.setY(i, h);
+
+        let c;
+        if      (h <  0)   c = C.water;
+        else if (h <  1)   c = mix(C.water,  C.sand,   h);
+        else if (h <  2)   c = C.sand;
+        else if (h <  7)   c = mix(C.grass,  C.forest, (h -  2) / 5);
+        else if (h < 14)   c = mix(C.forest, C.rock,   (h -  7) / 7);
+        else if (h < 20)   c = C.rock;
+        else               c = mix(C.rock,   C.snow,   (h - 20) / 6);
+
+        colors[i*3]     = c.r;
+        colors[i*3 + 1] = c.g;
+        colors[i*3 + 2] = c.b;
+      }
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.computeVertexNormals();
+
+      const terrain = new THREE.Mesh(
+        geo,
+        new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0.0 })
+      );
+      terrain.receiveShadow = true;
+      terrain.castShadow = true;
+      scene.add(terrain);
+
+      // ---- water plane ----
+      const water = new THREE.Mesh(
+        new THREE.PlaneGeometry(SIZE, SIZE),
+        new THREE.MeshStandardMaterial({
+          color: 0x2f6c97, transparent: true, opacity: 0.78,
+          roughness: 0.15, metalness: 0.4,
+        })
+      );
+      water.rotation.x = -Math.PI / 2;
+      water.position.y = 0;
+      water.receiveShadow = true;
+      scene.add(water);
+
+      // ---- lights ----
+      scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x404020, 0.55));
+      const sun = new THREE.DirectionalLight(0xfff1c4, 1.3);
+      sun.position.set(70, 100, 35);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      const s = sun.shadow.camera;
+      s.left = -130; s.right = 130; s.top = 130; s.bottom = -130;
+      s.near = 10;   s.far = 280;
+      scene.add(sun);
+
+      // ---- resize ----
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      // ---- HUD + loop ----
+      const hud = document.getElementById('hud');
+      const tris = (geo.index.count / 3) | 0;
+      let frames = 0, last = performance.now();
+
+      renderer.setAnimationLoop(() => {
+        controls.update();
+        renderer.render(scene, camera);
+        frames++;
+        const now = performance.now();
+        if (now - last >= 500) {
+          const fps = (frames * 1000 / (now - last)).toFixed(1);
+          hud.textContent = `${fps} fps · ${tris.toLocaleString()} tris · ${SEG}×${SEG} grid · shadow 2048²`;
+          frames = 0; last = now;
+        }
+      });
+    </script>
+  </body>
+</html>
