@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hotan Kingdom - SRO zone in Three.js</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #8caac4; overflow: hidden; }
+      canvas { display: block; }
+      #hud {
+        position: absolute; top: 8px; left: 8px;
+        font: 12px/1.4 ui-monospace, Menlo, monospace;
+        color: #fff; background: rgba(0,0,0,0.5);
+        padding: 8px 12px; border-radius: 4px;
+        pointer-events: none; max-width: 380px;
+      }
+      #hud b { color: #ffd877; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "three/addons/": "./vendor/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="hud">loading manifest...</div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+      const hud = document.getElementById('hud');
+      const ZONE = 'hotan_kingdom';
+      const ZONE_ROOT = `./zones/${ZONE}`;
+      const PRIM_MTRL_FLAG_ALPHA = 0x200;
+
+      // --- scene basics ---
+      const SKY = 0x8caac4;
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(SKY);
+
+      const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 1.0, 30000);
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.NoToneMapping;
+      document.body.appendChild(renderer.domElement);
+
+      // Camera will be re-framed after zone load.
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.minDistance = 50;
+      controls.maxDistance = 12000;
+      controls.maxPolarAngle = Math.PI * 0.495;
+
+      // --- lighting mirrors render_zone_in_blender.py setup ---
+      const hemi = new THREE.HemisphereLight(0xbcd6ff, 0x3d3220, 0.55);
+      scene.add(hemi);
+      const sun = new THREE.DirectionalLight(0xfff1c4, 2.6);
+      // Match Blender sun rotation_euler = (0.85, 0.15, 0.7); approximate by
+      // placing the directional light up and slightly south-east of center.
+      sun.position.set(1500, 2500, 1200);
+      sun.target.position.set(0, 0, 0);
+      scene.add(sun);
+      scene.add(sun.target);
+
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      // --- material cache so repeated textures share one GPU upload ---
+      const textureLoader = new THREE.TextureLoader();
+      const imageCache = new Map();     // url -> THREE.Texture
+      const materialCache = new Map();  // key  -> THREE.Material
+
+      function loadTexture(url) {
+        if (imageCache.has(url)) return imageCache.get(url);
+        const t = textureLoader.load(url);
+        t.colorSpace = THREE.SRGBColorSpace;
+        t.wrapS = THREE.RepeatWrapping;
+        t.wrapT = THREE.RepeatWrapping;
+        t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        imageCache.set(url, t);
+        return t;
+      }
+
+      function makeMaterial(texDir, texFile, baseColor, matFlag) {
+        const useAlpha = (matFlag & PRIM_MTRL_FLAG_ALPHA) !== 0;
+        const key = texFile
+          ? `tex:${texDir}/${texFile}:a=${useAlpha}`
+          : `flat:${baseColor.join(',')}`;
+        if (materialCache.has(key)) return materialCache.get(key);
+
+        const params = {
+          color: new THREE.Color(baseColor[0], baseColor[1], baseColor[2]),
+          roughness: 0.85,
+          metalness: 0.0,
+          side: THREE.DoubleSide, // some SRO submeshes have inverted normals
+        };
+        if (texFile) {
+          params.map = loadTexture(`${texDir}/${texFile}`);
+          if (useAlpha) {
+            params.transparent = true;
+            params.alphaTest = 0.5;
+          }
+        }
+        const mat = new THREE.MeshStandardMaterial(params);
+        materialCache.set(key, mat);
+        return mat;
+      }
+
+      // --- build one submesh / terrain mesh ---
+      function buildGeometry(vertices, faces, uvs) {
+        const n = vertices.length;
+        const pos = new Float32Array(n * 3);
+        const uv  = uvs && uvs.length === n ? new Float32Array(n * 2) : null;
+        for (let i = 0; i < n; i++) {
+          const v = vertices[i];
+          // SRO (X right, Y up, Z forward, LH) -> Three.js (Y up, RH):
+          // flip Z to convert handedness. CW winding becomes CCW automatically.
+          pos[i * 3]     = v[0];
+          pos[i * 3 + 1] = v[1];
+          pos[i * 3 + 2] = -v[2];
+          if (uv) {
+            const t = uvs[i];
+            uv[i * 2]     = t[0];
+            uv[i * 2 + 1] = 1.0 - t[1]; // SRO/DDS top-down -> GL bottom-up
+          }
+        }
+        const fcount = faces.length;
+        const idx = (n < 65536)
+          ? new Uint16Array(fcount * 3)
+          : new Uint32Array(fcount * 3);
+        for (let i = 0; i < fcount; i++) {
+          const f = faces[i];
+          idx[i * 3]     = f[0];
+          idx[i * 3 + 1] = f[1];
+          idx[i * 3 + 2] = f[2];
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        if (uv) geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+        geo.setIndex(new THREE.BufferAttribute(idx, 1));
+        geo.computeVertexNormals();
+        return geo;
+      }
+
+      function makeTerrainUVs(vertices, regionSize) {
+        // Map region-local (x, z) in [0, regionSize] to UV [0, 1].
+        // V is flipped so the PNG's top-left lands at z=0 (north edge of region).
+        const n = vertices.length;
+        const uv = new Float32Array(n * 2);
+        for (let i = 0; i < n; i++) {
+          uv[i * 2]     = vertices[i][0] / regionSize;
+          uv[i * 2 + 1] = 1.0 - vertices[i][2] / regionSize;
+        }
+        return uv;
+      }
+
+      function makeTerrainMaterial(terrainPngUrl) {
+        if (terrainPngUrl) {
+          const tex = loadTexture(terrainPngUrl);
+          return new THREE.MeshStandardMaterial({
+            map: tex,
+            roughness: 0.95,
+            metalness: 0.0,
+          });
+        }
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.55, 0.50, 0.42),
+          roughness: 0.95,
+        });
+      }
+
+      // --- per-region build ---
+      async function buildRegion(zoneRoot, entry, regionSize, parent) {
+        const region = entry.region;
+        const scenePath = `${zoneRoot}/${region}/scene.json`;
+        const data = await fetch(scenePath).then(r => r.json());
+
+        const [dx, dz] = entry.sector_offset;
+        const group = new THREE.Group();
+        group.name = `Region_${region}`;
+        // Sector offset: apply to group position. Z flipped for handedness.
+        group.position.set(dx * regionSize, 0, -(dz * regionSize));
+        parent.add(group);
+
+        // Terrain
+        const t = data.terrain;
+        const terrainGeo = buildGeometry(t.vertices, t.faces, null);
+        terrainGeo.setAttribute(
+          'uv',
+          new THREE.BufferAttribute(makeTerrainUVs(t.vertices, regionSize), 2),
+        );
+        const terrainPng = entry.terrain ? `${zoneRoot}/${region}/terrain.png` : null;
+        const terrainMesh = new THREE.Mesh(terrainGeo, makeTerrainMaterial(terrainPng));
+        terrainMesh.name = `Terrain_${region}`;
+        group.add(terrainMesh);
+
+        // Buildings
+        const texDir = `${zoneRoot}/${region}/textures`;
+        let smCount = 0;
+        for (const inst of data.instances) {
+          for (let si = 0; si < inst.submeshes.length; si++) {
+            const sub = inst.submeshes[si];
+            if (!sub.vertices.length || !sub.faces.length) continue;
+            const mat = makeMaterial(
+              texDir,
+              sub.texture || '',
+              sub.base_color || [0.6, 0.6, 0.6, 1.0],
+              sub.material_flag | 0,
+            );
+            const geo = buildGeometry(sub.vertices, sub.faces, sub.uvs);
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.name = `SM_${region}_${inst.asset_id}_${inst.unique_id}_${si}`;
+            group.add(mesh);
+            smCount++;
+          }
+        }
+        return { region, placements: data.instances.length, submeshes: smCount };
+      }
+
+      async function buildO2Region(zoneRoot, entry, regionEntry, regionSize, parent) {
+        const region = entry.region;
+        const scenePath = `${zoneRoot}/o2/${region}/scene.json`;
+        let data;
+        try {
+          data = await fetch(scenePath).then(r => {
+            if (!r.ok) throw new Error('no o2');
+            return r.json();
+          });
+        } catch (_e) {
+          return { region, submeshes: 0 };
+        }
+
+        const [dx, dz] = regionEntry.sector_offset;
+        const group = new THREE.Group();
+        group.name = `O2_Region_${region}`;
+        group.position.set(dx * regionSize, 0, -(dz * regionSize));
+        parent.add(group);
+
+        const texDir = `${zoneRoot}/o2/${region}/textures`;
+        let smCount = 0;
+        for (const inst of data.instances) {
+          for (let si = 0; si < inst.submeshes.length; si++) {
+            const sub = inst.submeshes[si];
+            if (!sub.vertices.length || !sub.faces.length) continue;
+            const mat = makeMaterial(
+              texDir,
+              sub.texture || '',
+              sub.base_color || [0.6, 0.6, 0.6, 1.0],
+              sub.material_flag | 0,
+            );
+            const geo = buildGeometry(sub.vertices, sub.faces, sub.uvs);
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.name = `O2_${region}_${inst.asset_id}_${inst.unique_id}_${si}`;
+            group.add(mesh);
+            smCount++;
+          }
+        }
+        return { region, submeshes: smCount };
+      }
+
+      function frameCamera(rootBox) {
+        const center = new THREE.Vector3();
+        rootBox.getCenter(center);
+        const size = new THREE.Vector3();
+        rootBox.getSize(size);
+        const radius = 0.5 * Math.max(size.x, size.z);
+
+        controls.target.copy(center);
+        // Perspective bird's-eye similar to render_zone_in_blender.py.
+        camera.position.set(
+          center.x + radius * 0.9,
+          rootBox.max.y + radius * 0.7,
+          center.z + radius * 1.1,
+        );
+        camera.near = 1.0;
+        camera.far = radius * 30 + 5000;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
+
+      async function main() {
+        hud.textContent = 'loading manifest...';
+        const manifest = await fetch(`${ZONE_ROOT}/manifest.json`).then(r => r.json());
+        const regionSize = manifest.region_size || 1920.0;
+
+        const zoneRoot = new THREE.Group();
+        zoneRoot.name = `Zone_${manifest.zone}`;
+        scene.add(zoneRoot);
+
+        const stats = { placements: 0, submeshes: 0, o2Submeshes: 0 };
+        for (const entry of manifest.regions) {
+          if (entry.status !== 'ok') continue;
+          hud.textContent = `loading region ${entry.region}...`;
+          const r = await buildRegion(ZONE_ROOT, entry, regionSize, zoneRoot);
+          stats.placements += r.placements;
+          stats.submeshes  += r.submeshes;
+        }
+
+        // .o2 decoration layer (optional, all regions)
+        const o2Root = new THREE.Group();
+        o2Root.name = `Zone_${manifest.zone}_o2_decorations`;
+        scene.add(o2Root);
+        const regionByName = new Map(manifest.regions.map(r => [r.region, r]));
+        for (const o2Entry of manifest.o2 || []) {
+          if (o2Entry.status !== 'ok') continue;
+          const regionEntry = regionByName.get(o2Entry.region);
+          if (!regionEntry) continue;
+          hud.textContent = `loading o2 ${o2Entry.region}...`;
+          const r = await buildO2Region(ZONE_ROOT, o2Entry, regionEntry, regionSize, o2Root);
+          stats.o2Submeshes += r.submeshes;
+        }
+
+        const box = new THREE.Box3().setFromObject(zoneRoot);
+        frameCamera(box);
+
+        // --- HUD with fps tick ---
+        let frames = 0, last = performance.now();
+        renderer.setAnimationLoop(() => {
+          controls.update();
+          renderer.render(scene, camera);
+          frames++;
+          const now = performance.now();
+          if (now - last >= 500) {
+            const fps = (frames * 1000 / (now - last)).toFixed(1);
+            hud.innerHTML =
+              `<b>${manifest.zone}</b> &middot; ${fps} fps<br>` +
+              `${manifest.regions.length} regions &middot; ` +
+              `${stats.placements} placements / ${stats.submeshes} submeshes<br>` +
+              `o2 decorations: ${stats.o2Submeshes} submeshes<br>` +
+              `${imageCache.size} textures &middot; ${materialCache.size} materials<br>` +
+              `drag = orbit &middot; scroll = zoom &middot; right-drag = pan`;
+            frames = 0; last = now;
+          }
+        });
+      }
+
+      main().catch(err => {
+        hud.textContent = 'error: ' + err.message;
+        console.error(err);
+      });
+    </script>
+  </body>
+</html>

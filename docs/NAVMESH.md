@@ -47,7 +47,7 @@ The other top-level scripts (`main.py`, `bench.py`, `bridge.py`, `sweep.py`) are
 2. **Walk Object.ifo → BSR/CPD → BMS** for each unique asset_id placed in the region.
 3. **Parse BMS slot 7** to get each asset's local navmesh: vertices + global_edges + internal_edges (also captures the BSR's friendly name for tree labels).
 4. **Lift NVM 2D edges to 3D** via bilinear heightmap sampling at each endpoint (silk-nav gotcha #24).
-5. **Bake BMS edges to world space** with the yaw-negated placement transform (CLAUDE.md gotcha #8).
+5. **Bake BMS edges to world space** with the yaw-negated placement transform ([gotcha #12](GOTCHAS.md#12-bms-placement-yaw-is-negated-in-the-localworld-transform)).
 6. **Group by (kind, source, bucket, flag)** — each leaf in the tree is one homogeneous group.
 7. **Pack groups into one binary blob** served at `/edges.bin` over the loopback HTTP server.
 8. **JS parses the blob** into `Map<group_id, LineSegments>` + `Map<group_id, Points>` and adds them to the scene.
@@ -129,7 +129,7 @@ When testing changes, these values should hold for `nv_5c87.nvm`:
 - BMS edges: ~2929 total (c1_castle 1848, c2_castle 319, c3_castle 319, palms 7×11=77, etc.)
 - 57 edge groups total (3 NVM + 54 BMS)
 - Wire blob: ~180 KB
-- Notable: zero `0x03` walls in NVM (silk-nav gotcha #67); all walls live in BMS files. The 1206 wall edges visible in 5c87 all come from BMS placements.
+- Notable: zero `0x03` walls in NVM ([gotcha #14](GOTCHAS.md#14-nvm-terrain-has-zero-0x03-walls--all-walls-live-in-bms-files)); all walls live in BMS files. The 1206 wall edges visible in 5c87 all come from BMS placements.
 
 Verify after parser changes:
 
