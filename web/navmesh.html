@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>SRO Navmesh Edges - Three.js</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #14161b; overflow: hidden; }
+      canvas { display: block; }
+      #hud {
+        position: absolute; top: 10px; left: 12px;
+        font: 12px/1.4 ui-monospace, Menlo, monospace;
+        color: #ddd; background: rgba(0,0,0,0.55);
+        padding: 6px 10px; border-radius: 4px; pointer-events: none;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "three/addons/": "./vendor/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="hud">loading edges...</div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+      const hud = document.getElementById('hud');
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x14161b);
+
+      const camera = new THREE.PerspectiveCamera(
+        55, innerWidth / innerHeight, 1, 30000
+      );
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.setSize(innerWidth, innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      // EdgeFlag colors. Mirror navmesh.py::flag_color_hex.
+      function edgeColor(flag) {
+        const block = flag & 0x03;
+        if (block === 0x03) return new THREE.Color(0xff3030);
+        if (block !== 0)    return new THREE.Color(0xff8c1a);
+        if (flag & 0x10)    return new THREE.Color(0xffd54f);
+        if (flag & 0x08)    return new THREE.Color(0x40c4ff);
+        if (flag & 0x04)    return new THREE.Color(0x80c980);
+        return new THREE.Color(0xff00ff);
+      }
+
+      // Per group_id: the LineSegments (edges + arrow chevrons) and a Points cloud
+      // for endpoint markers. The Points cloud is hidden by default; it shows only
+      // when a single leaf group is sole-highlighted.
+      const groupMeshes = new Map();
+      const endpointMeshes = new Map();
+
+      function buildGroupMeshes(groupId, segments, endpoints) {
+        // segments: Float32Array length S*7 (x0,y0,z0,x1,y1,z1,flag); may include arrow chevrons.
+        // endpoints: Float32Array length E*3 (x,y,z) -- 2 entries per original edge.
+        if (segments.length === 0) return null;
+        const flagSample = segments[6] | 0;
+        const color = edgeColor(flagSample);
+
+        const sCount = segments.length / 7;
+        const positions = new Float32Array(sCount * 6);
+        const colors = new Float32Array(sCount * 6);
+        for (let i = 0; i < sCount; i++) {
+          const o = i * 7;
+          positions[i * 6 + 0] = segments[o + 0];
+          positions[i * 6 + 1] = segments[o + 1];
+          positions[i * 6 + 2] = segments[o + 2];
+          positions[i * 6 + 3] = segments[o + 3];
+          positions[i * 6 + 4] = segments[o + 4];
+          positions[i * 6 + 5] = segments[o + 5];
+          colors[i * 6 + 0] = color.r; colors[i * 6 + 1] = color.g; colors[i * 6 + 2] = color.b;
+          colors[i * 6 + 3] = color.r; colors[i * 6 + 4] = color.g; colors[i * 6 + 5] = color.b;
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geo.computeBoundingBox();
+        const mat = new THREE.LineBasicMaterial({ vertexColors: true });
+        const mesh = new THREE.LineSegments(geo, mat);
+        mesh.userData.groupId = groupId;
+        scene.add(mesh);
+
+        // Endpoint markers (a Points cloud). Hidden until sole-highlighted.
+        if (endpoints.length > 0) {
+          const ptsGeo = new THREE.BufferGeometry();
+          ptsGeo.setAttribute('position', new THREE.BufferAttribute(endpoints, 3));
+          const ptsMat = new THREE.PointsMaterial({
+            color: 0xffffff,
+            size: 6,
+            sizeAttenuation: false,
+            depthTest: false,
+          });
+          const points = new THREE.Points(ptsGeo, ptsMat);
+          points.visible = false;
+          points.renderOrder = 999;
+          scene.add(points);
+          endpointMeshes.set(groupId, points);
+        }
+        return mesh;
+      }
+
+      // Parses /edges.bin layout::
+      //   u32 group_count
+      //   per group:
+      //       u32 group_id
+      //       u32 segment_count
+      //       u32 endpoint_count
+      //       segment_count * 7 * f32
+      //       endpoint_count * 3 * f32
+      function parseGroupedEdges(buf) {
+        let cursor = 0;
+        const dv = new DataView(buf);
+        const groupCount = dv.getUint32(cursor, true); cursor += 4;
+        let totalEdges = 0;
+        let totalSegments = 0;
+        for (let g = 0; g < groupCount; g++) {
+          const id = dv.getUint32(cursor, true); cursor += 4;
+          const sCount = dv.getUint32(cursor, true); cursor += 4;
+          const eCount = dv.getUint32(cursor, true); cursor += 4;
+          const segments = new Float32Array(buf, cursor, sCount * 7);
+          cursor += sCount * 7 * 4;
+          const endpoints = new Float32Array(buf, cursor, eCount * 3);
+          cursor += eCount * 3 * 4;
+          const mesh = buildGroupMeshes(id, segments, endpoints);
+          if (mesh) groupMeshes.set(id, mesh);
+          totalEdges += eCount / 2;
+          totalSegments += sCount;
+        }
+        return { groupCount, totalEdges, totalSegments };
+      }
+
+      // -------- Public API (called via QWebEngineView.runJavaScript) --------
+
+      window.setGroupVisible = function (groupId, visible) {
+        const m = groupMeshes.get(groupId | 0);
+        if (m) m.visible = !!visible;
+      };
+
+      // Empty list (or null) = no fade (all groups full opacity, no markers).
+      // Single-id list = sole-leaf highlight: dim others AND show that group's
+      // endpoint markers. Multi-id list (parent selection) = dim others, no markers.
+      window.setSelectedGroups = function (groupIds) {
+        const sel = new Set((groupIds || []).map(x => x | 0));
+        const noFade = sel.size === 0;
+        for (const [id, mesh] of groupMeshes) {
+          const isSel = noFade || sel.has(id);
+          mesh.material.opacity = isSel ? 1.0 : 0.12;
+          mesh.material.transparent = !isSel;
+          mesh.material.depthWrite = isSel;
+          mesh.material.needsUpdate = true;
+        }
+        const showMarkersFor = sel.size === 1 ? sel.values().next().value : null;
+        for (const [id, points] of endpointMeshes) {
+          points.visible = id === showMarkersFor;
+        }
+      };
+
+      // Snap the camera to fit the union AABB of the given group ids.
+      window.zoomToGroups = function (groupIds) {
+        if (!Array.isArray(groupIds) || groupIds.length === 0) return;
+        const box = new THREE.Box3();
+        let any = false;
+        for (const id of groupIds) {
+          const m = groupMeshes.get(id | 0);
+          if (!m || !m.visible) continue;
+          if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
+          box.union(m.geometry.boundingBox);
+          any = true;
+        }
+        if (!any) return;
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const span = Math.max(size.x, size.y, size.z, 1);
+        controls.target.copy(center);
+        camera.position.set(
+          center.x + span * 0.9,
+          center.y + Math.max(span * 0.7, 80),
+          center.z + span * 0.9,
+        );
+        camera.near = Math.max(span * 0.001, 0.1);
+        camera.far = Math.max(span * 50, 5000);
+        camera.updateProjectionMatrix();
+        controls.update();
+      };
+
+      // ----------------------------------------------------------------------
+
+      async function loadAll() {
+        const buf = await fetch('./edges.bin').then(r => r.arrayBuffer());
+        const stats = parseGroupedEdges(buf);
+
+        const everyId = Array.from(groupMeshes.keys());
+        if (everyId.length) window.zoomToGroups(everyId);
+
+        return stats;
+      }
+
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      let stats = null;
+      let frames = 0, last = performance.now();
+      renderer.setAnimationLoop(() => {
+        controls.update();
+        renderer.render(scene, camera);
+        frames++;
+        const now = performance.now();
+        if (stats && now - last >= 500) {
+          const fps = (frames * 1000 / (now - last)).toFixed(1);
+          hud.textContent =
+            `${fps} fps | ${stats.groupCount} groups | ` +
+            `${Math.round(stats.totalEdges).toLocaleString()} edges | ` +
+            `${stats.totalSegments.toLocaleString()} segments`;
+          frames = 0; last = now;
+        }
+      });
+
+      loadAll()
+        .then(s => { stats = s; })
+        .catch(err => {
+          hud.textContent = `load failed: ${err.message}`;
+          console.error(err);
+        });
+    </script>
+  </body>
+</html>
